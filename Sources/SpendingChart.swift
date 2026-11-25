@@ -3,7 +3,11 @@ import SwiftUI
 struct SpendingChart: View {
     let transactions: [Transaction]
     @Binding var selection: String?
-    private let colors: [Color] = [.teal, .blue, .orange, .pink, .indigo, .green, .purple, .brown]
+    private let colors: [Color] = [
+        Color(red: 0.40, green: 0.26, blue: 0.73), Color(red: 0.08, green: 0.48, blue: 0.52),
+        Color(red: 0.67, green: 0.32, blue: 0.18), Color(red: 0.53, green: 0.24, blue: 0.54),
+        Color(red: 0.22, green: 0.40, blue: 0.67), Color(red: 0.32, green: 0.45, blue: 0.26)
+    ]
 
     private struct Slice: Identifiable {
         let id: String
@@ -39,14 +43,15 @@ struct SpendingChart: View {
     var body: some View {
         let segments = slices
         if segments.isEmpty {
-            Text("目前沒有支出").foregroundStyle(.secondary)
+            Label("目前沒有支出", systemImage: "chart.pie").foregroundStyle(.secondary)
         } else {
-            VStack(spacing: 12) {
+            VStack(spacing: 15) {
                 ZStack {
                     ForEach(segments) { slice in
-                        let shape = Wedge(start: slice.start, end: slice.end)
-                        shape.fill(slice.color.opacity(selection == nil || selection == slice.id ? 1 : 0.28))
-                            .contentShape(shape)
+                        let shape = RingSlice(start: slice.start, end: slice.end)
+                        shape.fill(slice.color.opacity(selection == nil || selection == slice.id ? 1 : 0.28),
+                                   style: FillStyle(eoFill: true))
+                            .contentShape(shape, eoFill: true)
                             .onTapGesture { select(slice.id) }
                             .accessibilityHidden(true)
                     }
@@ -54,20 +59,34 @@ struct SpendingChart: View {
                         let angle = (slice.start + slice.end) / 2 * .pi / 180
                         Text(slice.percent)
                             .font(.caption2.weight(.semibold).monospacedDigit())
-                            .foregroundStyle(.white)
-                            .shadow(color: .black.opacity(0.65), radius: 2)
-                            .offset(x: CGFloat(cos(angle) * 51), y: CGFloat(sin(angle) * 51))
+                            .foregroundStyle(selection == nil || selection == slice.id ? Color.white : Color.primary)
+                            .offset(x: CGFloat(cos(angle) * 70), y: CGFloat(sin(angle) * 70))
                             .allowsHitTesting(false)
                             .accessibilityHidden(true)
                     }
+                    VStack(spacing: 4) {
+                        Text("支出合計")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        Text(segments.reduce(Decimal.zero) { $0 + $1.amount }.formatted())
+                            .font(.headline.monospacedDigit())
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.5)
+                    }
+                    .frame(width: 88)
+                    .allowsHitTesting(false)
+                    .accessibilityElement(children: .combine)
                 }
-                .frame(width: 156, height: 156)
+                .frame(width: 184, height: 184)
                 ForEach(segments) { slice in
                     Button { select(slice.id) } label: {
                         HStack {
-                            Circle().fill(slice.color).frame(width: 10, height: 10)
+                            RoundedRectangle(cornerRadius: 4).fill(slice.color).frame(width: 11, height: 11)
                             Text(slice.id)
-                            if selection == slice.id { Image(systemName: "checkmark") }
+                            if selection == slice.id {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(LedgerAppearance.accent)
+                            }
                             Spacer()
                             VStack(alignment: .trailing, spacing: 2) {
                                 Text(slice.amount.formatted())
@@ -75,6 +94,8 @@ struct SpendingChart: View {
                             }
                             .monospacedDigit()
                         }
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.borderless)
                 }
@@ -92,20 +113,24 @@ struct SpendingChart: View {
     }
 }
 
-private struct Wedge: Shape {
+private struct RingSlice: Shape {
     let start: Double
     let end: Double
 
     func path(in rect: CGRect) -> Path {
         let center = CGPoint(x: rect.midX, y: rect.midY)
         let radius = min(rect.width, rect.height) / 2
+        let innerRadius = radius * 0.53
         if end - start >= 359.999999 {
-            return Path(ellipseIn: rect)
+            var ring = Path(ellipseIn: rect)
+            ring.addEllipse(in: rect.insetBy(dx: radius - innerRadius, dy: radius - innerRadius))
+            return ring
         }
         var path = Path()
-        path.move(to: center)
         path.addArc(center: center, radius: radius, startAngle: .degrees(start),
                     endAngle: .degrees(end), clockwise: false)
+        path.addArc(center: center, radius: innerRadius, startAngle: .degrees(end),
+                    endAngle: .degrees(start), clockwise: true)
         path.closeSubpath()
         return path
     }

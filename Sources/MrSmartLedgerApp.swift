@@ -8,7 +8,7 @@ import Vision
 @main
 struct MrSmartLedgerApp: App {
     var body: some Scene {
-        WindowGroup { LedgerView() }
+        WindowGroup { LedgerView().tint(LedgerAppearance.accent) }
     }
 }
 
@@ -62,32 +62,47 @@ struct LedgerView: View {
     }
 
     private var monthNavigation: some View {
-        HStack {
-            Button {
-                if let month = neighboringMonth(-1) { selectMonth(month) }
-            } label: {
-                Label("上一個月", systemImage: "chevron.left").labelStyle(.iconOnly)
-            }
-            .buttonStyle(.borderless)
-            Spacer()
-            Menu {
-                Picker("月份", selection: Binding(get: { selectedMonth }, set: selectMonth)) {
-                    ForEach(monthOptions, id: \.self) { Text($0).tag($0) }
-                }
-            } label: {
-                Label(selectedMonth, systemImage: "calendar")
-                    .font(.headline.monospacedDigit())
+        LedgerGlassControls {
+            HStack(spacing: 12) {
+                monthArrow("上一個月", symbol: "chevron.left", offset: -1)
+                Spacer(minLength: 0)
+                Menu {
+                    Picker("月份", selection: Binding(get: { selectedMonth }, set: selectMonth)) {
+                        ForEach(monthOptions, id: \.self) { Text($0).tag($0) }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "calendar").foregroundStyle(LedgerAppearance.accent)
+                        Text(selectedMonth).monospacedDigit()
+                        Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 17)
+                    .frame(minHeight: 46)
+                    .contentShape(Capsule())
+                    .ledgerGlassControl(in: Capsule())
                     .accessibilityLabel("選擇月份 \(selectedMonth)")
+                }
+                Spacer(minLength: 0)
+                monthArrow("下一個月", symbol: "chevron.right", offset: 1)
+                    .disabled(selectedMonth >= (monthOptions.first ?? currentMonth))
             }
-            Spacer()
-            Button {
-                if let month = neighboringMonth(1) { selectMonth(month) }
-            } label: {
-                Label("下一個月", systemImage: "chevron.right").labelStyle(.iconOnly)
-            }
-            .buttonStyle(.borderless)
-            .disabled(selectedMonth >= (monthOptions.first ?? currentMonth))
         }
+    }
+
+    private func monthArrow(_ title: String, symbol: String, offset: Int) -> some View {
+        Button {
+            if let month = neighboringMonth(offset) { selectMonth(month) }
+        } label: {
+            Label(title, systemImage: symbol)
+                .labelStyle(.iconOnly)
+                .font(.subheadline.weight(.semibold))
+                .frame(width: 46, height: 46)
+                .contentShape(Circle())
+                .ledgerGlassControl(in: Circle())
+        }
+        .buttonStyle(.borderless)
     }
 
     private var monthSummary: some View {
@@ -101,53 +116,27 @@ struct LedgerView: View {
         let difference = net - previousNet
         let comparison = difference == 0 ? "持平" :
             "\(difference > 0 ? "增加" : "減少") \((difference > 0 ? difference : -difference).formatted())"
-        return Section("月份統計") {
-            LabeledContent("本月淨額", value: net.formatted())
-            LabeledContent("交易筆數", value: "\(transactions.count.formatted()) 筆")
-            LabeledContent("退款／折讓合計", value: refunds.formatted())
-            LabeledContent("較前月淨花費", value: comparison)
-        }
-        .monospacedDigit()
+        let comparisonIcon = difference == 0 ? "equal" : difference > 0 ? "arrow.up.right" : "arrow.down.right"
+        return LedgerMonthSummary(net: net, transactionCount: transactions.count, refunds: refunds,
+                                  comparison: comparison, comparisonIcon: comparisonIcon)
     }
 
     var body: some View {
-        NavigationStack {
-            List {
-                if let photoProgress {
-                    ProgressView(photoProgress)
-                }
-                monthNavigation
-                monthSummary
-                Section("支出分類百分比") {
-                    SpendingChart(transactions: monthTransactions, selection: $filter)
-                }
-                Section(filter ?? "交易明細") {
-                    if visible.isEmpty {
-                        Text("目前沒有交易").foregroundStyle(.secondary)
-                    }
-                    ForEach(visible) { transaction in
-                        Button {
-                            editing = transaction
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(transaction.description).foregroundStyle(.primary)
-                                    Text([transaction.day, transaction.category, transaction.merchant]
-                                        .filter { !$0.isEmpty }.joined(separator: " · "))
-                                        .font(.caption).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Text(transaction.amount.formatted()).monospacedDigit()
-                                    .foregroundStyle(.primary)
-                            }
-                        }
-                    }
-                    .onDelete { indexes in
-                        store.delete(Set(indexes.map { visible[$0].id }))
-                    }
+        ledgerNavigation
+            .photosPicker(isPresented: $showingPhotoPicker, selection: $photos, selectionBehavior: .ordered,
+                          matching: .images, preferredItemEncoding: .compatible)
+            .task(id: showingPhotoPicker ? [] : photos) {
+                if !showingPhotoPicker, !photos.isEmpty {
+                    await processBillPhotos(photos, mode: billPhotoMode)
                 }
             }
+    }
+
+    private var ledgerNavigation: some View {
+        NavigationStack {
+            ledgerList
             .navigationTitle("智慧記帳")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Menu {
@@ -174,6 +163,7 @@ struct LedgerView: View {
                     } label: {
                         Label("新增交易", systemImage: "plus")
                     }
+                    .buttonStyle(.borderedProminent)
                 }
             }
             .sheet(item: $editing, onDismiss: { photoDraftFailures = [] }) { transaction in
@@ -241,11 +231,63 @@ struct LedgerView: View {
                 Text(store.message ?? "")
             }
         }
-        .photosPicker(isPresented: $showingPhotoPicker, selection: $photos, selectionBehavior: .ordered,
-                      matching: .images, preferredItemEncoding: .compatible)
-        .task(id: showingPhotoPicker ? [] : photos) {
-            if !showingPhotoPicker, !photos.isEmpty {
-                await processBillPhotos(photos, mode: billPhotoMode)
+    }
+
+    private var ledgerList: some View {
+        List {
+            Section {
+                VStack(spacing: 15) {
+                    monthNavigation
+                    monthSummary
+                    if let photoProgress {
+                        ProgressView(photoProgress)
+                            .font(.subheadline)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 4)
+                    }
+                }
+                .listRowInsets(EdgeInsets(top: 9, leading: 0, bottom: 2, trailing: 0))
+                .listRowBackground(Color.clear)
+            }
+            Section("支出分類百分比") {
+                SpendingChart(transactions: monthTransactions, selection: $filter)
+            }
+            transactionSection
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .background { LedgerBackdrop() }
+    }
+
+    private var transactionSection: some View {
+        let transactions = visible
+        return Section(filter ?? "交易明細") {
+            if transactions.isEmpty {
+                Label("目前沒有交易", systemImage: "tray")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(transactions) { transaction in
+                Button {
+                    editing = transaction
+                } label: {
+                    LabeledContent {
+                        Text(transaction.amount.formatted())
+                            .font(.body.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(transaction.amount < 0 ? LedgerAppearance.accent : .primary)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(transaction.description).foregroundStyle(.primary)
+                            Text([transaction.day, transaction.category, transaction.merchant]
+                                .filter { !$0.isEmpty }.joined(separator: " · "))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 3)
+                    .contentShape(Rectangle())
+                }
+            }
+            .onDelete { indexes in
+                store.delete(Set(indexes.map { transactions[$0].id }))
             }
         }
     }

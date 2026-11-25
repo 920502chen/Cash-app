@@ -13,6 +13,10 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode with iOS 26 SDK
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+          xcodebuild -version
       - name: Test recurring expense schedules
         run: |
           swiftc Sources/RecurringExpense.swift Sources/LedgerStore.swift Tests/main.swift -o "$RUNNER_TEMP/recurring-expense-tests"
