@@ -24,6 +24,7 @@ struct LedgerView: View {
     @State private var photo: PhotosPickerItem?
     @State private var showSettings = false
     @State private var showCloud = false
+    @State private var showRecurring = false
     @State private var billPhoto: PhotosPickerItem?
     @State private var parsingBill = false
     @State private var billReview: BillReview?
@@ -148,6 +149,7 @@ struct LedgerView: View {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Menu {
                         Button { showSettings = true } label: { Label("分類與關鍵字", systemImage: "tag") }
+                        Button { showRecurring = true } label: { Label("週期性消費", systemImage: "repeat") }
                         Button { showCloud = true } label: { Label("Google Drive 與 Gemini", systemImage: "icloud") }
                         PhotosPicker(selection: $billPhoto, matching: .images) {
                             Label("用 Gemini 解析帳單", systemImage: "sparkles")
@@ -176,6 +178,7 @@ struct LedgerView: View {
             }
             .sheet(isPresented: $showSettings) { LedgerSettings(store: store) }
             .sheet(isPresented: $showCloud) { CloudSettings(cloud: cloud, store: store) }
+            .sheet(isPresented: $showRecurring) { RecurringExpenseList(store: store) }
             .sheet(item: $billReview) { review in
                 NavigationStack {
                     List(review.items) { item in
@@ -234,10 +237,19 @@ struct LedgerView: View {
                 }
                 if !Task.isCancelled { self.photo = nil }
             }
-            .task { await cloud.backup(store) }
+            .task {
+                store.postDueExpenses()
+                await cloud.backup(store)
+            }
             .onChange(of: store.revision) { _ in Task { await cloud.backup(store) } }
             .onChange(of: scenePhase) { phase in
-                if phase == .active { Task { await cloud.backup(store) } }
+                if phase == .active {
+                    store.postDueExpenses()
+                    Task { await cloud.backup(store) }
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.significantTimeChangeNotification)) { _ in
+                store.postDueExpenses()
             }
             .task(id: billPhoto) {
                 guard let billPhoto else { return }

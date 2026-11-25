@@ -104,8 +104,9 @@ final class LedgerCloud: ObservableObject {
                 guard store.revision == revision else {
                     throw LedgerError.invalid("下載期間修改了交易。請再按一次還原。")
                 }
-                try store.restore(backup)
+                let addedDueExpenses = try store.restore(backup)
                 marker = remoteMarker
+                if addedDueExpenses { backupRequested = true }
                 status = "已從 Google Drive 還原。"
                 return
             }

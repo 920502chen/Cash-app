@@ -31,6 +31,7 @@ struct LedgerPreferences: Codable {
 struct LedgerBook: Codable {
     var transactions: [Transaction] = []
     var settings = LedgerPreferences()
+    var recurringExpenses: [RecurringExpense]?
 
     var csv: String {
         let header = "spend_date,amount,description,category,merchant"
@@ -74,7 +75,8 @@ final class LedgerStore: ObservableObject {
     }
 
     var categories: [String] {
-        let all = book.settings.categories + book.transactions.map(\.category) + ["待分類", "退款"]
+        let all = book.settings.categories + book.transactions.map(\.category) +
+            (book.recurringExpenses ?? []).map(\.category) + ["待分類", "退款"]
         return Set(all).sorted()
     }
 
@@ -117,8 +119,56 @@ final class LedgerStore: ObservableObject {
         try write(updated)
     }
 
-    func restore(_ backup: LedgerBook) throws {
-        try write(backup)
+    @discardableResult
+    func restore(_ backup: LedgerBook) throws -> Bool {
+        var restored = backup
+        let added = postDueExpenses(in: &restored)
+        try write(restored)
+        return added
+    }
+
+    func saveRecurring(_ expense: RecurringExpense) throws {
+        var updated = book
+        var expenses = updated.recurringExpenses ?? []
+        if let index = expenses.firstIndex(where: { $0.id == expense.id }) {
+            expenses[index] = expense
+        } else {
+            expenses.append(expense)
+        }
+        updated.recurringExpenses = expenses
+        _ = postDueExpenses(in: &updated)
+        try write(updated)
+    }
+
+    func deleteRecurring(_ id: UUID) throws {
+        var updated = book
+        updated.recurringExpenses?.removeAll { $0.id == id }
+        try write(updated)
+    }
+
+    func postDueExpenses() {
+        var updated = book
+        if postDueExpenses(in: &updated) { persist(updated) }
+    }
+
+    @discardableResult
+    private func postDueExpenses(in updated: inout LedgerBook) -> Bool {
+        guard var rules = updated.recurringExpenses, !rules.isEmpty else { return false }
+        let today = Transaction.dateFormatter.string(from: Date())
+        var existing = Set(updated.transactions.map(\.id))
+        var advanced = false
+        for index in rules.indices where rules[index].amount > 0 {
+            while let day = rules[index].nextDay, day <= today {
+                let transaction = rules[index].transaction(on: day)
+                if existing.insert(transaction.id).inserted {
+                    updated.transactions.append(transaction)
+                }
+                rules[index].nextIndex += 1
+                advanced = true
+            }
+        }
+        if advanced { updated.recurringExpenses = rules }
+        return advanced
     }
 
     func legacyBackup(csv: Data?, settings: Data?) throws -> LedgerBook {
@@ -137,7 +187,7 @@ final class LedgerStore: ObservableObject {
 
     var hasLocalData: Bool {
         let defaults = LedgerPreferences()
-        return !book.transactions.isEmpty || !book.settings.keyword_rules.isEmpty ||
+        return !book.transactions.isEmpty || !(book.recurringExpenses ?? []).isEmpty || !book.settings.keyword_rules.isEmpty ||
             Set(book.settings.categories) != Set(defaults.categories)
     }
 
