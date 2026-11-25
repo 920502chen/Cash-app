@@ -59,6 +59,8 @@ final class LedgerStore: ObservableObject {
     private let file = URL.applicationSupportDirectory.appendingPathComponent("ledger.json")
     private var canWrite = true
 
+    var canSynchronize: Bool { canWrite }
+
     init() {
         do {
             book = try JSONDecoder().decode(LedgerBook.self, from: Data(contentsOf: file))

@@ -91,6 +91,9 @@ final class LedgerCloud: ObservableObject {
     }
 
     private func synchronize(_ store: LedgerStore, restore: Bool) async throws {
+        guard store.canSynchronize else {
+            throw LedgerError.invalid("本機資料讀取失敗，已停止 Drive 同步以保留原本的備份。")
+        }
         let drive = try await DriveBackup(token: authorization.token())
         let file = try await drive.file(named: DriveBackup.filename)
         if let file {
