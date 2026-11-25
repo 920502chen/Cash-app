@@ -16,6 +16,6 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: 智慧記帳
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         TARGETED_DEVICE_FAMILY: 1
-        MARKETING_VERSION: "2.3.2"
-        CURRENT_PROJECT_VERSION: 7
+        MARKETING_VERSION: "2.3.3"
+        CURRENT_PROJECT_VERSION: 8
         SWIFT_VERSION: "5.0"

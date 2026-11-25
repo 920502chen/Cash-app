@@ -19,12 +19,14 @@ struct LedgerView: View {
     @State private var filter: String?
     @State private var selectedMonth = String(Transaction.dateFormatter.string(from: Date()).prefix(7))
     @State private var editing: Transaction?
+    @State private var photoDraftFailures: [String] = []
     @State private var importing = false
     @State private var exporting = false
-    @State private var photo: PhotosPickerItem?
+    @State private var photos: [PhotosPickerItem] = []
     @State private var showingPhotoPicker = false
     @State private var billPhotoMode = BillPhotoMode.text
-    @State private var processingPhoto = false
+    @State private var photoProgress: String?
+    private var processingPhoto: Bool { photoProgress != nil }
     @State private var showSettings = false
     @State private var showCloud = false
     @State private var showRecurring = false
@@ -111,8 +113,8 @@ struct LedgerView: View {
     var body: some View {
         NavigationStack {
             List {
-                if processingPhoto {
-                    ProgressView(billPhotoMode == .gemini ? "Gemini 正在解析帳單…" : "正在辨識帳單文字…")
+                if let photoProgress {
+                    ProgressView(photoProgress)
                 }
                 monthNavigation
                 monthSummary
@@ -174,19 +176,22 @@ struct LedgerView: View {
                     }
                 }
             }
-            .sheet(item: $editing) { transaction in
-                TransactionEditor(transaction: transaction, store: store)
+            .sheet(item: $editing, onDismiss: { photoDraftFailures = [] }) { transaction in
+                TransactionEditor(transaction: transaction, store: store, photoFailures: photoDraftFailures)
             }
             .sheet(isPresented: $showSettings) { LedgerSettings(store: store) }
             .sheet(isPresented: $showCloud) { CloudSettings(cloud: cloud, store: store) }
             .sheet(isPresented: $showRecurring) { RecurringExpenseList(store: store) }
             .sheet(item: $billReview) { review in
                 NavigationStack {
-                    List(review.items) { item in
-                        VStack(alignment: .leading, spacing: 5) {
-                            LabeledContent(item.description, value: item.amount.formatted())
-                            Text([item.day, item.category, item.merchant].filter { !$0.isEmpty }.joined(separator: " · "))
-                                .font(.caption).foregroundStyle(.secondary)
+                    List {
+                        PhotoImportFailures(messages: review.failures)
+                        ForEach(review.items) { item in
+                            VStack(alignment: .leading, spacing: 5) {
+                                LabeledContent(item.description, value: item.amount.formatted())
+                                Text([item.day, item.category, item.merchant].filter { !$0.isEmpty }.joined(separator: " · "))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                         }
                     }
                     .navigationTitle("確認帳單交易")
@@ -236,11 +241,11 @@ struct LedgerView: View {
                 Text(store.message ?? "")
             }
         }
-        .photosPicker(isPresented: $showingPhotoPicker, selection: $photo, matching: .images,
-                      preferredItemEncoding: .compatible)
-        .task(id: showingPhotoPicker ? nil : photo) {
-            if !showingPhotoPicker, let photo {
-                await processBillPhoto(photo, mode: billPhotoMode)
+        .photosPicker(isPresented: $showingPhotoPicker, selection: $photos, selectionBehavior: .ordered,
+                      matching: .images, preferredItemEncoding: .compatible)
+        .task(id: showingPhotoPicker ? [] : photos) {
+            if !showingPhotoPicker, !photos.isEmpty {
+                await processBillPhotos(photos, mode: billPhotoMode)
             }
         }
     }
@@ -252,65 +257,91 @@ struct LedgerView: View {
             return
         }
         billPhotoMode = mode
-        photo = nil
+        photos = []
         showingPhotoPicker = true
     }
 
-    private func processBillPhoto(_ item: PhotosPickerItem, mode: BillPhotoMode) async {
-        processingPhoto = true
+    private func processBillPhotos(_ items: [PhotosPickerItem], mode: BillPhotoMode) async {
+        let key = cloud.geminiKey
+        let model = cloud.geminiModel
+        let categories = store.categories
+        let rules = store.book.settings.keyword_rules
+        let today = Transaction.dateFormatter.string(from: Date())
+        if mode == .gemini && key == nil {
+            photos = []
+            showCloud = true
+            return
+        }
         defer {
-            processingPhoto = false
-            photo = nil
+            photoProgress = nil
+            photos = []
         }
-        do {
-            guard let data = try await item.loadTransferable(type: Data.self) else {
-                throw LedgerError.invalid("無法讀取帳單照片。請確認照片已下載，或改選另一張。")
-            }
-            try Task.checkCancellation()
-            switch mode {
-            case .text:
-                let recognized = try await Task.detached(priority: .userInitiated) {
-                    let request = VNRecognizeTextRequest()
-                    request.recognitionLevel = .accurate
-                    request.automaticallyDetectsLanguage = true
-                    try VNImageRequestHandler(data: data).perform([request])
-                    return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
-                }.value
+        var transactions: [Transaction] = []
+        var recognizedPages: [[String]] = []
+        var failures: [String] = []
+        for (index, item) in items.enumerated() {
+            let process = mode == .gemini ? "Gemini 正在解析" : "正在辨識文字"
+            photoProgress = "\(process)（\(index + 1)/\(items.count)）"
+            do {
                 try Task.checkCancellation()
-                guard let first = recognized.first else {
-                    throw LedgerError.invalid("照片中找不到可辨識的文字。")
+                guard let data = try await item.loadTransferable(type: Data.self) else {
+                    throw LedgerError.invalid("無法讀取照片，請確認照片已下載。")
                 }
-                var draft = Transaction()
-                draft.description = recognized.joined(separator: "\n")
-                draft.merchant = first
-                editing = draft
-            case .gemini:
-                guard let key = cloud.geminiKey else {
-                    showCloud = true
-                    return
+                if let key, mode == .gemini {
+                    let parsed = try await GeminiBillParser.parse(
+                        jpeg: try billJPEG(from: data), key: key, model: model, today: today,
+                        categories: categories, rules: rules)
+                    guard !parsed.isEmpty else {
+                        throw LedgerError.invalid("Gemini 沒有從這張照片找到交易。")
+                    }
+                    transactions.append(contentsOf: parsed)
+                } else {
+                    let recognized = try await recognizeBillText(data)
+                    guard !recognized.isEmpty else {
+                        throw LedgerError.invalid("照片中找不到可辨識的文字。")
+                    }
+                    recognizedPages.append(recognized)
                 }
-                guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-                      let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                        kCGImageSourceCreateThumbnailFromImageAlways: true,
-                        kCGImageSourceCreateThumbnailWithTransform: true,
-                        kCGImageSourceThumbnailMaxPixelSize: 2400
-                      ] as CFDictionary),
-                      let jpeg = UIImage(cgImage: image).jpegData(compressionQuality: 0.83) else {
-                    throw LedgerError.invalid("無法轉換帳單照片。")
-                }
-                let transactions = try await GeminiBillParser.parse(
-                    jpeg: jpeg, key: key, model: cloud.geminiModel,
-                    today: Transaction.dateFormatter.string(from: Date()),
-                    categories: store.categories, rules: store.book.settings.keyword_rules)
-                try Task.checkCancellation()
-                guard !transactions.isEmpty else {
-                    throw LedgerError.invalid("Gemini 沒有從這張照片找到交易。")
-                }
-                billReview = BillReview(items: transactions)
+            } catch {
+                guard !Task.isCancelled else { return }
+                failures.append("第 \(index + 1) 張：\(error.localizedDescription)")
             }
-        } catch {
-            if !Task.isCancelled { store.message = error.localizedDescription }
         }
+        guard !Task.isCancelled else { return }
+        if !transactions.isEmpty {
+            billReview = BillReview(items: transactions, failures: failures)
+        } else if let first = recognizedPages.first?.first {
+            var draft = Transaction()
+            draft.description = recognizedPages.map { $0.joined(separator: "\n") }.joined(separator: "\n\n")
+            draft.merchant = first
+            photoDraftFailures = failures
+            editing = draft
+        } else {
+            store.message = failures.joined(separator: "\n")
+        }
+    }
+
+    private func recognizeBillText(_ data: Data) async throws -> [String] {
+        try await Task.detached(priority: .userInitiated) {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.automaticallyDetectsLanguage = true
+            try VNImageRequestHandler(data: data).perform([request])
+            return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+        }.value
+    }
+
+    private func billJPEG(from data: Data) throws -> Data {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 2400
+              ] as CFDictionary),
+              let jpeg = UIImage(cgImage: image).jpegData(compressionQuality: 0.83) else {
+            throw LedgerError.invalid("無法轉換帳單照片。")
+        }
+        return jpeg
     }
 }
 
@@ -321,17 +352,34 @@ private enum BillPhotoMode {
 private struct BillReview: Identifiable {
     let id = UUID()
     let items: [Transaction]
+    let failures: [String]
+}
+
+private struct PhotoImportFailures: View {
+    let messages: [String]
+
+    var body: some View {
+        if !messages.isEmpty {
+            Section("未完成的照片") {
+                ForEach(messages, id: \.self) { message in
+                    Text(message).font(.footnote)
+                }
+            }
+        }
+    }
 }
 
 private struct TransactionEditor: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: LedgerStore
+    let photoFailures: [String]
     @State private var transaction: Transaction
     @State private var date: Date
     @State private var amountText: String
 
-    init(transaction: Transaction, store: LedgerStore) {
+    init(transaction: Transaction, store: LedgerStore, photoFailures: [String]) {
         self.store = store
+        self.photoFailures = photoFailures
         _transaction = State(initialValue: transaction)
         _date = State(initialValue: Transaction.dateFormatter.date(from: transaction.day) ?? Date())
         _amountText = State(initialValue: transaction.amount == 0 ? "" : String(describing: transaction.amount))
@@ -342,6 +390,7 @@ private struct TransactionEditor: View {
     var body: some View {
         NavigationStack {
             Form {
+                PhotoImportFailures(messages: photoFailures)
                 DatePicker("交易日期", selection: $date, displayedComponents: .date)
                 TextField("金額", text: $amountText).keyboardType(.numbersAndPunctuation)
                 TextField("商家", text: $transaction.merchant)
