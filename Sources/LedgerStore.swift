@@ -54,6 +54,7 @@ enum LedgerError: LocalizedError {
 @MainActor
 final class LedgerStore: ObservableObject {
     @Published private(set) var book = LedgerBook()
+    @Published private(set) var revision = 0
     @Published var message: String?
     private let file = URL.applicationSupportDirectory.appendingPathComponent("ledger.json")
     private var canWrite = true
@@ -96,6 +97,46 @@ final class LedgerStore: ObservableObject {
         var updated = book
         updated.transactions.removeAll { ids.contains($0.id) }
         persist(updated)
+    }
+
+    func addRecognized(_ transactions: [Transaction]) throws {
+        var updated = book
+        updated.transactions.append(contentsOf: transactions.map { item in
+            var item = item
+            if item.amount < 0 {
+                item.category = "退款"
+            } else if let rule = updated.settings.keyword_rules.first(where: {
+                (item.description + " " + item.merchant).localizedCaseInsensitiveContains($0.keyword)
+            }) {
+                item.category = rule.category
+            }
+            return item
+        })
+        try write(updated)
+    }
+
+    func restore(_ backup: LedgerBook) throws {
+        try write(backup)
+    }
+
+    func legacyBackup(csv: Data?, settings: Data?) throws -> LedgerBook {
+        var backup = LedgerBook()
+        if let csv {
+            guard let source = String(data: csv, encoding: .utf8) else {
+                throw LedgerError.invalid("Drive 交易備份不是 UTF-8 CSV。")
+            }
+            backup.transactions = try LedgerCSV.transactions(from: source)
+        }
+        if let settings {
+            backup.settings = try JSONDecoder().decode(LedgerPreferences.self, from: settings)
+        }
+        return backup
+    }
+
+    var hasLocalData: Bool {
+        let defaults = LedgerPreferences()
+        return !book.transactions.isEmpty || !book.settings.keyword_rules.isEmpty ||
+            Set(book.settings.categories) != Set(defaults.categories)
     }
 
     func addCategory(_ name: String) {
@@ -165,6 +206,7 @@ final class LedgerStore: ObservableObject {
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(updated).write(to: file, options: .atomic)
         book = updated
+        revision += 1
     }
 }
 

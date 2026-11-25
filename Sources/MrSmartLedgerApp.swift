@@ -1,5 +1,7 @@
 import PhotosUI
+import ImageIO
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 import Vision
 
@@ -12,12 +14,18 @@ struct MrSmartLedgerApp: App {
 
 struct LedgerView: View {
     @StateObject private var store = LedgerStore()
+    @StateObject private var cloud = LedgerCloud()
+    @Environment(\.scenePhase) private var scenePhase
     @State private var filter: String?
     @State private var editing: Transaction?
     @State private var importing = false
     @State private var exporting = false
     @State private var photo: PhotosPickerItem?
     @State private var showSettings = false
+    @State private var showCloud = false
+    @State private var billPhoto: PhotosPickerItem?
+    @State private var parsingBill = false
+    @State private var billReview: BillReview?
 
     private var visible: [Transaction] {
         store.book.transactions.filter { filter == nil || $0.category == filter }
@@ -27,6 +35,9 @@ struct LedgerView: View {
     var body: some View {
         NavigationStack {
             List {
+                if parsingBill {
+                    ProgressView("Gemini 正在解析帳單…")
+                }
                 Section("支出分類") {
                     SpendingChart(transactions: store.book.transactions, selection: $filter)
                 }
@@ -61,6 +72,10 @@ struct LedgerView: View {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Menu {
                         Button { showSettings = true } label: { Label("分類與關鍵字", systemImage: "tag") }
+                        Button { showCloud = true } label: { Label("Google Drive 與 Gemini", systemImage: "icloud") }
+                        PhotosPicker(selection: $billPhoto, matching: .images) {
+                            Label("用 Gemini 解析帳單", systemImage: "sparkles")
+                        }.disabled(parsingBill)
                         Button { importing = true } label: { Label("匯入 CSV 或 JSON", systemImage: "square.and.arrow.down") }
                         Button { exporting = true } label: { Label("匯出交易 CSV", systemImage: "square.and.arrow.up") }
                         PhotosPicker(selection: $photo, matching: .images) {
@@ -80,6 +95,33 @@ struct LedgerView: View {
                 TransactionEditor(transaction: transaction, store: store)
             }
             .sheet(isPresented: $showSettings) { LedgerSettings(store: store) }
+            .sheet(isPresented: $showCloud) { CloudSettings(cloud: cloud, store: store) }
+            .sheet(item: $billReview) { review in
+                NavigationStack {
+                    List(review.items) { item in
+                        VStack(alignment: .leading, spacing: 5) {
+                            LabeledContent(item.description, value: item.amount.formatted())
+                            Text([item.day, item.category, item.merchant].filter { !$0.isEmpty }.joined(separator: " · "))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .navigationTitle("確認帳單交易")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) { Button("取消") { billReview = nil } }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("匯入 \(review.items.count) 筆") {
+                                do {
+                                    try store.addRecognized(review.items)
+                                    billReview = nil
+                                } catch {
+                                    billReview = nil
+                                    store.message = error.localizedDescription
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             .fileImporter(isPresented: $importing, allowedContentTypes: [.commaSeparatedText, .json]) { result in
                 do { try store.importFile(result.get()) }
                 catch { store.message = error.localizedDescription }
@@ -112,6 +154,48 @@ struct LedgerView: View {
                 }
                 if !Task.isCancelled { self.photo = nil }
             }
+            .task { await cloud.backup(store) }
+            .onChange(of: store.revision) { _ in Task { await cloud.backup(store) } }
+            .onChange(of: scenePhase) { phase in
+                if phase == .active { Task { await cloud.backup(store) } }
+            }
+            .task(id: billPhoto) {
+                guard let billPhoto else { return }
+                defer {
+                    if !Task.isCancelled {
+                        parsingBill = false
+                        self.billPhoto = nil
+                    }
+                }
+                guard let key = cloud.geminiKey else {
+                    showCloud = true
+                    return
+                }
+                parsingBill = true
+                do {
+                    guard let data = try await billPhoto.loadTransferable(type: Data.self),
+                          let source = CGImageSourceCreateWithData(data as CFData, nil),
+                          let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                            kCGImageSourceCreateThumbnailFromImageAlways: true,
+                            kCGImageSourceCreateThumbnailWithTransform: true,
+                            kCGImageSourceThumbnailMaxPixelSize: 2400
+                          ] as CFDictionary),
+                          let jpeg = UIImage(cgImage: image).jpegData(compressionQuality: 0.83) else {
+                        throw LedgerError.invalid("無法讀取帳單圖片。")
+                    }
+                    let transactions = try await GeminiBillParser.parse(
+                        jpeg: jpeg, key: key, model: cloud.geminiModel,
+                        today: Transaction.dateFormatter.string(from: Date()),
+                        categories: store.categories, rules: store.book.settings.keyword_rules)
+                    guard !Task.isCancelled else { return }
+                    guard !transactions.isEmpty else {
+                        throw LedgerError.invalid("Gemini 沒有從這張照片找到交易。")
+                    }
+                    billReview = BillReview(items: transactions)
+                } catch {
+                    if !Task.isCancelled { store.message = error.localizedDescription }
+                }
+            }
             .alert("智慧記帳", isPresented: Binding(get: { store.message != nil }, set: {
                 if !$0 { store.message = nil }
             })) {
@@ -121,6 +205,11 @@ struct LedgerView: View {
             }
         }
     }
+}
+
+private struct BillReview: Identifiable {
+    let id = UUID()
+    let items: [Transaction]
 }
 
 private struct TransactionEditor: View {
