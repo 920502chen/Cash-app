@@ -61,7 +61,7 @@ struct LedgerMonthSummary: View {
 
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @ScaledMetric(relativeTo: .largeTitle) private var amountSize = 44
+    @ScaledMetric(relativeTo: .largeTitle) private var amountSize: CGFloat = 44
 
     private let shape = RoundedRectangle(cornerRadius: 30, style: .continuous)
 
