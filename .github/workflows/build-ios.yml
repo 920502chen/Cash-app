@@ -1,0 +1,35 @@
+name: Build iPhone IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+      - name: Build unsigned iPhone app
+        run: |
+          xcodebuild -project MrSmartLedger.xcodeproj -scheme MrSmartLedger \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Package IPA
+        run: |
+          mkdir -p package/Payload
+          ditto build/Build/Products/Release-iphoneos/MrSmartLedger.app package/Payload/MrSmartLedger.app
+          cd package
+          ditto -c -k --keepParent Payload MrSmartLedger.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MrSmartLedger-unsigned
+          path: package/MrSmartLedger.ipa
+          if-no-files-found: error
