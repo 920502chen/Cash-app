@@ -41,13 +41,18 @@ enum LedgerSecrets {
 private struct APIStatusError: LocalizedError {
     let service: String
     let status: Int
+    let retryAfter: TimeInterval?
     var errorDescription: String? { "\(service) 請求失敗（HTTP \(status)）。" }
 }
 
 private func responseData(_ request: URLRequest, service: String) async throws -> Data {
     let (data, response) = try await URLSession.shared.data(for: request)
     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-    guard (200..<300).contains(status) else { throw APIStatusError(service: service, status: status) }
+    guard (200..<300).contains(status) else {
+        let retryHeader = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")
+        let retryAfter = retryHeader.flatMap { TimeInterval($0) }
+        throw APIStatusError(service: service, status: status, retryAfter: retryAfter)
+    }
     return data
 }
 
@@ -278,7 +283,7 @@ enum GeminiBillParser {
         request.setValue(key, forHTTPHeaderField: "x-goog-api-key")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let response = try JSONDecoder().decode(Response.self, from: await responseData(request, service: "Gemini"))
+        let response = try JSONDecoder().decode(Response.self, from: await generateWithRetry(request))
         let json = response.candidates?.first?.content?.parts?.filter { $0.thought != true }
             .compactMap(\.text).joined() ?? ""
         guard !json.isEmpty else { throw LedgerError.invalid("Gemini 未回傳可讀的交易。") }
@@ -291,5 +296,20 @@ enum GeminiBillParser {
                                category: line.amount < 0 ? "退款" : categories.contains(line.category) ? line.category : "待分類",
                                merchant: line.merchant)
         }
+    }
+
+    private static func generateWithRetry(_ request: URLRequest) async throws -> Data {
+        let delays: [TimeInterval] = [1.5, 3.0]
+        for attempt in 0...delays.count {
+            try Task.checkCancellation()
+            do {
+                return try await responseData(request, service: "Gemini")
+            } catch let error as APIStatusError where error.status == 503 {
+                guard attempt < delays.count, (error.retryAfter ?? 0) <= 10 else { break }
+                let delay = max(delays[attempt] + Double.random(in: 0...0.4), error.retryAfter ?? 0)
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+        throw LedgerError.invalid("Gemini 暫時無法處理這張帳單（HTTP 503）。請稍後再試，或使用「從帳單照片辨識文字」先擷取內容。")
     }
 }
