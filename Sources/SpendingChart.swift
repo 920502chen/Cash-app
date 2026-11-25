@@ -11,6 +11,11 @@ struct SpendingChart: View {
         let start: Double
         let end: Double
         let color: Color
+        let share: Double
+
+        var percent: String {
+            share.formatted(.percent.precision(.fractionLength(0...1)))
+        }
     }
 
     private var slices: [Slice] {
@@ -24,9 +29,10 @@ struct SpendingChart: View {
             $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value
         }.enumerated().map { index, category in
             let start = angle
-            angle += 360 * NSDecimalNumber(decimal: category.value / total).doubleValue
+            let share = NSDecimalNumber(decimal: category.value / total).doubleValue
+            angle += 360 * share
             return Slice(id: category.key, amount: category.value, start: start, end: angle,
-                         color: colors[index % colors.count])
+                         color: colors[index % colors.count], share: share)
         }
     }
 
@@ -44,6 +50,16 @@ struct SpendingChart: View {
                             .onTapGesture { select(slice.id) }
                             .accessibilityHidden(true)
                     }
+                    ForEach(segments.filter { $0.share >= 0.09 }) { slice in
+                        let angle = (slice.start + slice.end) / 2 * .pi / 180
+                        Text(slice.percent)
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(.white)
+                            .shadow(color: .black.opacity(0.65), radius: 2)
+                            .offset(x: CGFloat(cos(angle) * 51), y: CGFloat(sin(angle) * 51))
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
                 }
                 .frame(width: 156, height: 156)
                 ForEach(segments) { slice in
@@ -53,7 +69,11 @@ struct SpendingChart: View {
                             Text(slice.id)
                             if selection == slice.id { Image(systemName: "checkmark") }
                             Spacer()
-                            Text(slice.amount.formatted()).monospacedDigit()
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text(slice.amount.formatted())
+                                Text(slice.percent).font(.caption).foregroundStyle(.secondary)
+                            }
+                            .monospacedDigit()
                         }
                     }
                     .buttonStyle(.borderless)

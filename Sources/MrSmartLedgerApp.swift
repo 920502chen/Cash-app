@@ -17,6 +17,7 @@ struct LedgerView: View {
     @StateObject private var cloud = LedgerCloud()
     @Environment(\.scenePhase) private var scenePhase
     @State private var filter: String?
+    @State private var selectedMonth = String(Transaction.dateFormatter.string(from: Date()).prefix(7))
     @State private var editing: Transaction?
     @State private var importing = false
     @State private var exporting = false
@@ -27,9 +28,82 @@ struct LedgerView: View {
     @State private var parsingBill = false
     @State private var billReview: BillReview?
 
+    private var currentMonth: String {
+        String(Transaction.dateFormatter.string(from: Date()).prefix(7))
+    }
+
+    private var monthOptions: [String] {
+        let recordedMonths = store.book.transactions.map { String($0.day.prefix(7)) }
+        return Set(recordedMonths + [currentMonth, selectedMonth]).sorted(by: >)
+    }
+
+    private var monthTransactions: [Transaction] {
+        store.book.transactions.filter { String($0.day.prefix(7)) == selectedMonth }
+    }
+
     private var visible: [Transaction] {
-        store.book.transactions.filter { filter == nil || $0.category == filter }
+        monthTransactions.filter { filter == nil || $0.category == filter }
             .sorted { $0.day > $1.day }
+    }
+
+    private func neighboringMonth(_ offset: Int) -> String? {
+        guard let date = Transaction.dateFormatter.date(from: selectedMonth + "-01"),
+              let other = Calendar(identifier: .gregorian).date(byAdding: .month, value: offset, to: date) else { return nil }
+        return String(Transaction.dateFormatter.string(from: other).prefix(7))
+    }
+
+    private func selectMonth(_ month: String) {
+        selectedMonth = month
+        filter = nil
+    }
+
+    private var monthNavigation: some View {
+        HStack {
+            Button {
+                if let month = neighboringMonth(-1) { selectMonth(month) }
+            } label: {
+                Label("上一個月", systemImage: "chevron.left").labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            Spacer()
+            Menu {
+                Picker("月份", selection: Binding(get: { selectedMonth }, set: selectMonth)) {
+                    ForEach(monthOptions, id: \.self) { Text($0).tag($0) }
+                }
+            } label: {
+                Label(selectedMonth, systemImage: "calendar")
+                    .font(.headline.monospacedDigit())
+                    .accessibilityLabel("選擇月份 \(selectedMonth)")
+            }
+            Spacer()
+            Button {
+                if let month = neighboringMonth(1) { selectMonth(month) }
+            } label: {
+                Label("下一個月", systemImage: "chevron.right").labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            .disabled(selectedMonth >= (monthOptions.first ?? currentMonth))
+        }
+    }
+
+    private var monthSummary: some View {
+        let transactions = monthTransactions
+        let net = transactions.reduce(Decimal.zero) { $0 + $1.amount }
+        let refunds = transactions.filter { $0.amount < 0 }.reduce(Decimal.zero) { $0 + $1.amount }
+        let previousMonth = neighboringMonth(-1)
+        let previousNet = store.book.transactions
+            .filter { String($0.day.prefix(7)) == previousMonth }
+            .reduce(Decimal.zero) { $0 + $1.amount }
+        let difference = net - previousNet
+        let comparison = difference == 0 ? "持平" :
+            "\(difference > 0 ? "增加" : "減少") \((difference > 0 ? difference : -difference).formatted())"
+        return Section("月份統計") {
+            LabeledContent("本月淨額", value: net.formatted())
+            LabeledContent("交易筆數", value: "\(transactions.count.formatted()) 筆")
+            LabeledContent("退款／折讓合計", value: refunds.formatted())
+            LabeledContent("較前月淨花費", value: comparison)
+        }
+        .monospacedDigit()
     }
 
     var body: some View {
@@ -38,8 +112,10 @@ struct LedgerView: View {
                 if parsingBill {
                     ProgressView("Gemini 正在解析帳單…")
                 }
-                Section("支出分類") {
-                    SpendingChart(transactions: store.book.transactions, selection: $filter)
+                monthNavigation
+                monthSummary
+                Section("支出分類百分比") {
+                    SpendingChart(transactions: monthTransactions, selection: $filter)
                 }
                 Section(filter ?? "交易明細") {
                     if visible.isEmpty {
@@ -86,7 +162,11 @@ struct LedgerView: View {
                     }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { editing = Transaction() } label: {
+                    Button {
+                        var draft = Transaction()
+                        if selectedMonth != currentMonth { draft.day = selectedMonth + "-01" }
+                        editing = draft
+                    } label: {
                         Label("新增交易", systemImage: "plus")
                     }
                 }

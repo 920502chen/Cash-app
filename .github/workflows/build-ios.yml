@@ -24,8 +24,10 @@ jobs:
             -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
       - name: Package IPA
         run: |
+          app=build/Build/Products/Release-iphoneos/MrSmartLedger.app
+          test "$(plutil -extract CFBundleIcons.CFBundlePrimaryIcon.CFBundleIconName raw -o - "$app/Info.plist")" = AppIcon
           mkdir -p package/Payload
-          ditto build/Build/Products/Release-iphoneos/MrSmartLedger.app package/Payload/MrSmartLedger.app
+          ditto "$app" package/Payload/MrSmartLedger.app
           cd package
           ditto -c -k --keepParent Payload MrSmartLedger.ipa
       - uses: actions/upload-artifact@v4
