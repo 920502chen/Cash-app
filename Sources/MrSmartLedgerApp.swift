@@ -22,11 +22,12 @@ struct LedgerView: View {
     @State private var importing = false
     @State private var exporting = false
     @State private var photo: PhotosPickerItem?
+    @State private var showingPhotoPicker = false
+    @State private var billPhotoMode = BillPhotoMode.text
+    @State private var processingPhoto = false
     @State private var showSettings = false
     @State private var showCloud = false
     @State private var showRecurring = false
-    @State private var billPhoto: PhotosPickerItem?
-    @State private var parsingBill = false
     @State private var billReview: BillReview?
 
     private var currentMonth: String {
@@ -110,8 +111,8 @@ struct LedgerView: View {
     var body: some View {
         NavigationStack {
             List {
-                if parsingBill {
-                    ProgressView("Gemini 正在解析帳單…")
+                if processingPhoto {
+                    ProgressView(billPhotoMode == .gemini ? "Gemini 正在解析帳單…" : "正在辨識帳單文字…")
                 }
                 monthNavigation
                 monthSummary
@@ -151,14 +152,14 @@ struct LedgerView: View {
                         Button { showSettings = true } label: { Label("分類與關鍵字", systemImage: "tag") }
                         Button { showRecurring = true } label: { Label("週期性消費", systemImage: "repeat") }
                         Button { showCloud = true } label: { Label("Google Drive 與 Gemini", systemImage: "icloud") }
-                        PhotosPicker(selection: $billPhoto, matching: .images) {
+                        Button { selectBillPhoto(.gemini) } label: {
                             Label("用 Gemini 解析帳單", systemImage: "sparkles")
-                        }.disabled(parsingBill)
+                        }.disabled(processingPhoto)
                         Button { importing = true } label: { Label("匯入 CSV 或 JSON", systemImage: "square.and.arrow.down") }
                         Button { exporting = true } label: { Label("匯出交易 CSV", systemImage: "square.and.arrow.up") }
-                        PhotosPicker(selection: $photo, matching: .images) {
+                        Button { selectBillPhoto(.text) } label: {
                             Label("從帳單照片辨識文字", systemImage: "text.viewfinder")
-                        }
+                        }.disabled(processingPhoto)
                     } label: {
                         Label("工具", systemImage: "ellipsis.circle")
                     }
@@ -213,30 +214,6 @@ struct LedgerView: View {
                           contentType: .commaSeparatedText, defaultFilename: "transactions_backup") { result in
                 if case .failure(let error) = result { store.message = error.localizedDescription }
             }
-            .task(id: photo) {
-                guard let photo else { return }
-                do {
-                    guard let data = try await photo.loadTransferable(type: Data.self) else {
-                        throw LedgerError.invalid("無法讀取圖片。")
-                    }
-                    let recognized = try await Task.detached(priority: .userInitiated) {
-                        let request = VNRecognizeTextRequest()
-                        request.recognitionLevel = .accurate
-                        request.automaticallyDetectsLanguage = true
-                        try VNImageRequestHandler(data: data).perform([request])
-                        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
-                    }.value
-                    guard !Task.isCancelled else { return }
-                    guard !recognized.isEmpty else { throw LedgerError.invalid("照片中找不到可辨識的文字。") }
-                    var draft = Transaction()
-                    draft.description = recognized.joined(separator: "\n")
-                    draft.merchant = recognized[0]
-                    editing = draft
-                } catch {
-                    if !Task.isCancelled { store.message = error.localizedDescription }
-                }
-                if !Task.isCancelled { self.photo = nil }
-            }
             .task {
                 store.postDueExpenses()
                 await cloud.backup(store)
@@ -251,43 +228,6 @@ struct LedgerView: View {
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.significantTimeChangeNotification)) { _ in
                 store.postDueExpenses()
             }
-            .task(id: billPhoto) {
-                guard let billPhoto else { return }
-                defer {
-                    if !Task.isCancelled {
-                        parsingBill = false
-                        self.billPhoto = nil
-                    }
-                }
-                guard let key = cloud.geminiKey else {
-                    showCloud = true
-                    return
-                }
-                parsingBill = true
-                do {
-                    guard let data = try await billPhoto.loadTransferable(type: Data.self),
-                          let source = CGImageSourceCreateWithData(data as CFData, nil),
-                          let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                            kCGImageSourceCreateThumbnailFromImageAlways: true,
-                            kCGImageSourceCreateThumbnailWithTransform: true,
-                            kCGImageSourceThumbnailMaxPixelSize: 2400
-                          ] as CFDictionary),
-                          let jpeg = UIImage(cgImage: image).jpegData(compressionQuality: 0.83) else {
-                        throw LedgerError.invalid("無法讀取帳單圖片。")
-                    }
-                    let transactions = try await GeminiBillParser.parse(
-                        jpeg: jpeg, key: key, model: cloud.geminiModel,
-                        today: Transaction.dateFormatter.string(from: Date()),
-                        categories: store.categories, rules: store.book.settings.keyword_rules)
-                    guard !Task.isCancelled else { return }
-                    guard !transactions.isEmpty else {
-                        throw LedgerError.invalid("Gemini 沒有從這張照片找到交易。")
-                    }
-                    billReview = BillReview(items: transactions)
-                } catch {
-                    if !Task.isCancelled { store.message = error.localizedDescription }
-                }
-            }
             .alert("智慧記帳", isPresented: Binding(get: { store.message != nil }, set: {
                 if !$0 { store.message = nil }
             })) {
@@ -296,7 +236,86 @@ struct LedgerView: View {
                 Text(store.message ?? "")
             }
         }
+        .photosPicker(isPresented: $showingPhotoPicker, selection: $photo, matching: .images,
+                      preferredItemEncoding: .compatible)
+        .task(id: showingPhotoPicker ? nil : photo) {
+            if !showingPhotoPicker, let photo {
+                await processBillPhoto(photo, mode: billPhotoMode)
+            }
+        }
     }
+
+    private func selectBillPhoto(_ mode: BillPhotoMode) {
+        guard !processingPhoto else { return }
+        if mode == .gemini && cloud.geminiKey == nil {
+            showCloud = true
+            return
+        }
+        billPhotoMode = mode
+        photo = nil
+        showingPhotoPicker = true
+    }
+
+    private func processBillPhoto(_ item: PhotosPickerItem, mode: BillPhotoMode) async {
+        processingPhoto = true
+        defer {
+            processingPhoto = false
+            photo = nil
+        }
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self) else {
+                throw LedgerError.invalid("無法讀取帳單照片。請確認照片已下載，或改選另一張。")
+            }
+            try Task.checkCancellation()
+            switch mode {
+            case .text:
+                let recognized = try await Task.detached(priority: .userInitiated) {
+                    let request = VNRecognizeTextRequest()
+                    request.recognitionLevel = .accurate
+                    request.automaticallyDetectsLanguage = true
+                    try VNImageRequestHandler(data: data).perform([request])
+                    return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+                }.value
+                try Task.checkCancellation()
+                guard let first = recognized.first else {
+                    throw LedgerError.invalid("照片中找不到可辨識的文字。")
+                }
+                var draft = Transaction()
+                draft.description = recognized.joined(separator: "\n")
+                draft.merchant = first
+                editing = draft
+            case .gemini:
+                guard let key = cloud.geminiKey else {
+                    showCloud = true
+                    return
+                }
+                guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                      let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 2400
+                      ] as CFDictionary),
+                      let jpeg = UIImage(cgImage: image).jpegData(compressionQuality: 0.83) else {
+                    throw LedgerError.invalid("無法轉換帳單照片。")
+                }
+                let transactions = try await GeminiBillParser.parse(
+                    jpeg: jpeg, key: key, model: cloud.geminiModel,
+                    today: Transaction.dateFormatter.string(from: Date()),
+                    categories: store.categories, rules: store.book.settings.keyword_rules)
+                try Task.checkCancellation()
+                guard !transactions.isEmpty else {
+                    throw LedgerError.invalid("Gemini 沒有從這張照片找到交易。")
+                }
+                billReview = BillReview(items: transactions)
+            }
+        } catch {
+            if !Task.isCancelled { store.message = error.localizedDescription }
+        }
+    }
+}
+
+private enum BillPhotoMode {
+    case text, gemini
 }
 
 private struct BillReview: Identifiable {
